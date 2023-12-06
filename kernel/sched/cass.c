@@ -274,8 +274,8 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool rt)
 		 * that would reduce CASS's energy efficiency due to
 		 * disproportionate P-states.
 		 */
-		curr->util =
-			curr->util * SCHED_CAPACITY_SCALE / curr->cap;
+		curr->util = min_t(unsigned long, SCHED_CAPACITY_SCALE,
+				   curr->util * SCHED_CAPACITY_SCALE / curr->cap);
 
 		/*
 		 * Check if this CPU is better than the best CPU found so far.
