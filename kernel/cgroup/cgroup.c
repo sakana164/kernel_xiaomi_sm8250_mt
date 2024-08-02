@@ -712,6 +712,8 @@ EXPORT_SYMBOL_GPL(of_css);
 			;						\
 		else
 
+static struct kmem_cache *cgrp_cset_link_pool;
+
 /*
  * The default css_set - used by init and its children prior to any
  * hierarchies being mounted. It contains a pointer to the root state
@@ -728,8 +730,7 @@ struct css_set init_css_set = {
 	.task_iters		= LIST_HEAD_INIT(init_css_set.task_iters),
 	.threaded_csets		= LIST_HEAD_INIT(init_css_set.threaded_csets),
 	.cgrp_links		= LIST_HEAD_INIT(init_css_set.cgrp_links),
-	.mg_src_preload_node	= LIST_HEAD_INIT(init_css_set.mg_src_preload_node),
-	.mg_dst_preload_node	= LIST_HEAD_INIT(init_css_set.mg_dst_preload_node),
+	.mg_preload_node	= LIST_HEAD_INIT(init_css_set.mg_preload_node),
 	.mg_node		= LIST_HEAD_INIT(init_css_set.mg_node),
 
 	/*
@@ -941,7 +942,7 @@ void put_css_set_locked(struct css_set *cset)
 		list_del(&link->cgrp_link);
 		if (cgroup_parent(link->cgrp))
 			cgroup_put(link->cgrp);
-		kfree(link);
+		kmem_cache_free(cgrp_cset_link_pool, link);
 	}
 
 	if (css_set_threaded(cset)) {
@@ -1091,7 +1092,7 @@ static void free_cgrp_cset_links(struct list_head *links_to_free)
 
 	list_for_each_entry_safe(link, tmp_link, links_to_free, cset_link) {
 		list_del(&link->cset_link);
-		kfree(link);
+		kmem_cache_free(cgrp_cset_link_pool, link);
 	}
 }
 
@@ -1111,7 +1112,7 @@ static int allocate_cgrp_cset_links(int count, struct list_head *tmp_links)
 	INIT_LIST_HEAD(tmp_links);
 
 	for (i = 0; i < count; i++) {
-		link = kzalloc(sizeof(*link), GFP_KERNEL);
+		link = kmem_cache_zalloc(cgrp_cset_link_pool, GFP_KERNEL);
 		if (!link) {
 			free_cgrp_cset_links(tmp_links);
 			return -ENOMEM;
@@ -1203,8 +1204,7 @@ static struct css_set *find_css_set(struct css_set *old_cset,
 	INIT_LIST_HEAD(&cset->threaded_csets);
 	INIT_HLIST_NODE(&cset->hlist);
 	INIT_LIST_HEAD(&cset->cgrp_links);
-	INIT_LIST_HEAD(&cset->mg_src_preload_node);
-	INIT_LIST_HEAD(&cset->mg_dst_preload_node);
+	INIT_LIST_HEAD(&cset->mg_preload_node);
 	INIT_LIST_HEAD(&cset->mg_node);
 
 	/* Copy the set of subsystem state objects generated in
@@ -1324,7 +1324,7 @@ static void cgroup_destroy_root(struct cgroup_root *root)
 	list_for_each_entry_safe(link, tmp_link, &cgrp->cset_links, cset_link) {
 		list_del(&link->cset_link);
 		list_del(&link->cgrp_link);
-		kfree(link);
+		kmem_cache_free(cgrp_cset_link_pool, link);
 	}
 
 	spin_unlock_irq(&css_set_lock);
@@ -2566,27 +2566,21 @@ int cgroup_migrate_vet_dst(struct cgroup *dst_cgrp)
  */
 void cgroup_migrate_finish(struct cgroup_mgctx *mgctx)
 {
+	LIST_HEAD(preloaded);
 	struct css_set *cset, *tmp_cset;
 
 	lockdep_assert_held(&cgroup_mutex);
 
 	spin_lock_irq(&css_set_lock);
 
-	list_for_each_entry_safe(cset, tmp_cset, &mgctx->preloaded_src_csets,
-				 mg_src_preload_node) {
-		cset->mg_src_cgrp = NULL;
-		cset->mg_dst_cgrp = NULL;
-		cset->mg_dst_cset = NULL;
-		list_del_init(&cset->mg_src_preload_node);
-		put_css_set_locked(cset);
-	}
+	list_splice_tail_init(&mgctx->preloaded_src_csets, &preloaded);
+	list_splice_tail_init(&mgctx->preloaded_dst_csets, &preloaded);
 
-	list_for_each_entry_safe(cset, tmp_cset, &mgctx->preloaded_dst_csets,
-				 mg_dst_preload_node) {
+	list_for_each_entry_safe(cset, tmp_cset, &preloaded, mg_preload_node) {
 		cset->mg_src_cgrp = NULL;
 		cset->mg_dst_cgrp = NULL;
 		cset->mg_dst_cset = NULL;
-		list_del_init(&cset->mg_dst_preload_node);
+		list_del_init(&cset->mg_preload_node);
 		put_css_set_locked(cset);
 	}
 
@@ -2628,7 +2622,7 @@ void cgroup_migrate_add_src(struct css_set *src_cset,
 
 	src_cgrp = cset_cgroup_from_root(src_cset, dst_cgrp->root);
 
-	if (!list_empty(&src_cset->mg_src_preload_node))
+	if (!list_empty(&src_cset->mg_preload_node))
 		return;
 
 	WARN_ON(src_cset->mg_src_cgrp);
@@ -2639,7 +2633,7 @@ void cgroup_migrate_add_src(struct css_set *src_cset,
 	src_cset->mg_src_cgrp = src_cgrp;
 	src_cset->mg_dst_cgrp = dst_cgrp;
 	get_css_set(src_cset);
-	list_add_tail(&src_cset->mg_src_preload_node, &mgctx->preloaded_src_csets);
+	list_add_tail(&src_cset->mg_preload_node, &mgctx->preloaded_src_csets);
 }
 
 /**
@@ -2664,7 +2658,7 @@ int cgroup_migrate_prepare_dst(struct cgroup_mgctx *mgctx)
 
 	/* look up the dst cset for each src cset and link it to src */
 	list_for_each_entry_safe(src_cset, tmp_cset, &mgctx->preloaded_src_csets,
-				 mg_src_preload_node) {
+				 mg_preload_node) {
 		struct css_set *dst_cset;
 		struct cgroup_subsys *ss;
 		int ssid;
@@ -2683,7 +2677,7 @@ int cgroup_migrate_prepare_dst(struct cgroup_mgctx *mgctx)
 		if (src_cset == dst_cset) {
 			src_cset->mg_src_cgrp = NULL;
 			src_cset->mg_dst_cgrp = NULL;
-			list_del_init(&src_cset->mg_src_preload_node);
+			list_del_init(&src_cset->mg_preload_node);
 			put_css_set(src_cset);
 			put_css_set(dst_cset);
 			continue;
@@ -2691,8 +2685,8 @@ int cgroup_migrate_prepare_dst(struct cgroup_mgctx *mgctx)
 
 		src_cset->mg_dst_cset = dst_cset;
 
-		if (list_empty(&dst_cset->mg_dst_preload_node))
-			list_add_tail(&dst_cset->mg_dst_preload_node,
+		if (list_empty(&dst_cset->mg_preload_node))
+			list_add_tail(&dst_cset->mg_preload_node,
 				      &mgctx->preloaded_dst_csets);
 		else
 			put_css_set(dst_cset);
@@ -2923,8 +2917,7 @@ static int cgroup_update_dfl_csses(struct cgroup *cgrp)
 		goto out_finish;
 
 	spin_lock_irq(&css_set_lock);
-	list_for_each_entry(src_cset, &mgctx.preloaded_src_csets,
-			    mg_src_preload_node) {
+	list_for_each_entry(src_cset, &mgctx.preloaded_src_csets, mg_preload_node) {
 		struct task_struct *task, *ntask;
 
 		/* all tasks in src_csets need to be migrated */
@@ -5035,10 +5028,10 @@ static void css_free_rwork_fn(struct work_struct *work)
 	}
 }
 
-static void css_release_work_fn(struct work_struct *work)
+static void css_release_work_fn(struct swork_event *sev)
 {
 	struct cgroup_subsys_state *css =
-		container_of(work, struct cgroup_subsys_state, destroy_work);
+		container_of(sev, struct cgroup_subsys_state, destroy_swork);
 	struct cgroup_subsys *ss = css->ss;
 	struct cgroup *cgrp = css->cgroup;
 
@@ -5100,8 +5093,8 @@ static void css_release(struct percpu_ref *ref)
 	struct cgroup_subsys_state *css =
 		container_of(ref, struct cgroup_subsys_state, refcnt);
 
-	INIT_WORK(&css->destroy_work, css_release_work_fn);
-	queue_work(cgroup_destroy_wq, &css->destroy_work);
+	INIT_SWORK(&css->destroy_swork, css_release_work_fn);
+	swork_queue(&css->destroy_swork);
 }
 
 static void init_and_link_css(struct cgroup_subsys_state *css,
@@ -5751,6 +5744,8 @@ int __init cgroup_init(void)
 	struct cgroup_subsys *ss;
 	int ssid;
 
+	cgrp_cset_link_pool = KMEM_CACHE(cgrp_cset_link, SLAB_HWCACHE_ALIGN | SLAB_PANIC);
+
 	BUILD_BUG_ON(CGROUP_SUBSYS_COUNT > 16);
 	BUG_ON(percpu_init_rwsem(&cgroup_threadgroup_rwsem));
 	BUG_ON(cgroup_init_cftypes(NULL, cgroup_base_files));
@@ -5859,6 +5854,7 @@ static int __init cgroup_wq_init(void)
 	 */
 	cgroup_destroy_wq = alloc_workqueue("cgroup_destroy", 0, 1);
 	BUG_ON(!cgroup_destroy_wq);
+	BUG_ON(swork_get());
 	return 0;
 }
 core_initcall(cgroup_wq_init);

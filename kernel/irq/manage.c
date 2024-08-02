@@ -24,12 +24,6 @@
 
 #include "internals.h"
 
-struct irq_desc_list {
-	struct list_head list;
-	struct irq_desc *desc;
-	unsigned int perf_flag;
-};
-
 static LIST_HEAD(perf_crit_irqs);
 static DEFINE_RAW_SPINLOCK(perf_irqs_lock);
 static int perf_cpu_index = -1;
@@ -37,6 +31,7 @@ static int prime_cpu_index = -1;
 static bool perf_crit_suspended;
 
 #ifdef CONFIG_IRQ_FORCED_THREADING
+# ifndef CONFIG_PREEMPT_RT_BASE
 __read_mostly bool force_irqthreads;
 EXPORT_SYMBOL_GPL(force_irqthreads);
 
@@ -46,6 +41,7 @@ static int __init setup_forced_irqthreads(char *arg)
 	return 0;
 }
 early_param("threadirqs", setup_forced_irqthreads);
+# endif
 #endif
 
 static void __synchronize_hardirq(struct irq_desc *desc, bool sync_chip)
@@ -441,6 +437,8 @@ irq_set_affinity_notifier(unsigned int irq, struct irq_affinity_notify *notify)
 	raw_spin_unlock_irqrestore(&desc->lock, flags);
 
 	if (old_notify) {
+		if (notify)
+			WARN(1, "overwriting previous IRQ affinity notifier\n");
 		if (cancel_work_sync(&old_notify->work)) {
 			/* Pending work had a ref, put that one too */
 			kref_put(&old_notify->kref, old_notify->release);
@@ -1013,7 +1011,15 @@ irq_forced_thread_fn(struct irq_desc *desc, struct irqaction *action)
 	irq_finalize_oneshot(desc, action);
 	if (!IS_ENABLED(CONFIG_PREEMPT_RT_BASE))
 		local_irq_enable();
-	local_bh_enable();
+	/*
+	 * Interrupts which have real time requirements can be set up
+	 * to avoid softirq processing in the thread handler. This is
+	 * safe as these interrupts do not raise soft interrupts.
+	 */
+	if (irq_settings_no_softirq_call(desc))
+		_local_bh_enable();
+	else
+		local_bh_enable();
 	return ret;
 }
 
@@ -1276,19 +1282,6 @@ setup_irq_thread(struct irqaction *new, unsigned int irq, bool secondary)
 	return 0;
 }
 
-static void add_desc_to_perf_list(struct irq_desc *desc, unsigned int perf_flag)
-{
-	struct irq_desc_list *item;
-
-	item = kmalloc(sizeof(*item), GFP_ATOMIC | __GFP_NOFAIL);
-	item->desc = desc;
-	item->perf_flag = perf_flag;
-
-	raw_spin_lock(&perf_irqs_lock);
-	list_add(&item->list, &perf_crit_irqs);
-	raw_spin_unlock(&perf_irqs_lock);
-}
-
 static void affine_one_perf_thread(struct irqaction *action)
 {
 	const struct cpumask *mask;
@@ -1348,8 +1341,8 @@ static void affine_one_perf_irq(struct irq_desc *desc, unsigned int perf_flag)
 
 void setup_perf_irq_locked(struct irq_desc *desc, unsigned int perf_flag)
 {
-	add_desc_to_perf_list(desc, perf_flag);
 	raw_spin_lock(&perf_irqs_lock);
+	list_add(&desc->perf_list, &perf_crit_irqs);
 	affine_one_perf_irq(desc, perf_flag);
 	raw_spin_unlock(&perf_irqs_lock);
 }
@@ -1375,14 +1368,12 @@ void irq_set_perf_affinity(unsigned int irq, unsigned int perf_flag)
 
 void unaffine_perf_irqs(void)
 {
-	struct irq_desc_list *data;
+	struct irq_desc *desc;
 	unsigned long flags;
 
 	raw_spin_lock_irqsave(&perf_irqs_lock, flags);
 	perf_crit_suspended = true;
-	list_for_each_entry(data, &perf_crit_irqs, list) {
-		struct irq_desc *desc = data->desc;
-
+	list_for_each_entry(desc, &perf_crit_irqs, perf_list) {
 		raw_spin_lock(&desc->lock);
 		irq_set_affinity_locked(&desc->irq_data, cpu_all_mask, true);
 		unaffine_one_perf_thread(desc->action);
@@ -1393,7 +1384,7 @@ void unaffine_perf_irqs(void)
 
 void reaffine_perf_irqs(bool from_hotplug)
 {
-	struct irq_desc_list *data;
+	struct irq_desc *desc;
 	unsigned long flags;
 
 	raw_spin_lock_irqsave(&perf_irqs_lock, flags);
@@ -1402,11 +1393,9 @@ void reaffine_perf_irqs(bool from_hotplug)
 		perf_crit_suspended = false;
 		perf_cpu_index = -1;
 		prime_cpu_index = -1;
-		list_for_each_entry(data, &perf_crit_irqs, list) {
-			struct irq_desc *desc = data->desc;
-
+		list_for_each_entry(desc, &perf_crit_irqs, perf_list) {
 			raw_spin_lock(&desc->lock);
-			affine_one_perf_irq(desc, data->perf_flag);
+			affine_one_perf_irq(desc, desc->action->flags);
 			affine_one_perf_thread(desc->action);
 			raw_spin_unlock(&desc->lock);
 		}
@@ -1686,11 +1675,14 @@ __setup_irq(unsigned int irq, struct irq_desc *desc, struct irqaction *new)
 			irqd_set(&desc->irq_data, IRQD_NO_BALANCING);
 		}
 
-		if (new->flags & (IRQF_PERF_AFFINE | IRQF_PRIME_AFFINE)) {
-			affine_one_perf_thread(new);
-			irqd_set(&desc->irq_data, IRQD_PERF_CRITICAL);
-			*old_ptr = new;
-		}
+                if (new->flags & (IRQF_PERF_AFFINE | IRQF_PRIME_AFFINE)) {
+                        affine_one_perf_thread(new);
+                        irqd_set(&desc->irq_data, IRQD_PERF_CRITICAL);
+                        *old_ptr = new;
+                }
+
+		if (new->flags & IRQF_NO_SOFTIRQ_CALL)
+			irq_settings_set_no_softirq_call(desc);
 
 		if (irq_settings_can_autoenable(desc)) {
 			irq_startup(desc, IRQ_RESEND, IRQ_START_COND);
@@ -1752,6 +1744,7 @@ mismatch:
 	if (!(new->flags & IRQF_PROBE_SHARED)) {
 		pr_err("Flags mismatch irq %d. %08x (%s) vs. %08x (%s)\n",
 		       irq, new->flags, new->name, old->flags, old->name);
+		panic("Mismatched flags for shared IRQ handler");
 #ifdef CONFIG_DEBUG_SHIRQ
 		dump_stack();
 #endif
@@ -1853,16 +1846,8 @@ static struct irqaction *__free_irq(struct irq_desc *desc, void *dev_id)
 	}
 
 	if (irqd_has_set(&desc->irq_data, IRQD_PERF_CRITICAL)) {
-		struct irq_desc_list *data;
-
 		raw_spin_lock(&perf_irqs_lock);
-		list_for_each_entry(data, &perf_crit_irqs, list) {
-			if (data->desc == desc) {
-				list_del(&data->list);
-				kfree(data);
-				break;
-			}
-		}
+		list_del(&desc->perf_list);
 		raw_spin_unlock(&perf_irqs_lock);
 	}
 
@@ -2506,7 +2491,7 @@ EXPORT_SYMBOL_GPL(irq_get_irqchip_state);
  *	This call sets the internal irqchip state of an interrupt,
  *	depending on the value of @which.
  *
- *	This function should be called with preemption disabled if the
+ *	This function should be called with migration disabled if the
  *	interrupt controller has per-cpu registers.
  */
 int irq_set_irqchip_state(unsigned int irq, enum irqchip_irq_state which,

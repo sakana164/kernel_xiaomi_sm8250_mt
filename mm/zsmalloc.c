@@ -56,6 +56,7 @@
 #include <linux/wait.h>
 #include <linux/pagemap.h>
 #include <linux/fs.h>
+#include <linux/locallock.h>
 
 #define ZSPAGE_MAGIC	0x58
 
@@ -73,8 +74,21 @@
  */
 #define ZS_MAX_ZSPAGE_ORDER 2
 #define ZS_MAX_PAGES_PER_ZSPAGE (_AC(1, UL) << ZS_MAX_ZSPAGE_ORDER)
-
 #define ZS_HANDLE_SIZE (sizeof(unsigned long))
+
+#ifdef CONFIG_PREEMPT_RT_FULL
+
+struct zsmalloc_handle {
+	unsigned long addr;
+	struct mutex lock;
+};
+
+#define ZS_HANDLE_ALLOC_SIZE (sizeof(struct zsmalloc_handle))
+
+#else
+
+#define ZS_HANDLE_ALLOC_SIZE (sizeof(unsigned long))
+#endif
 
 /*
  * Object location (<PFN>, <obj_idx>) is encoded as
@@ -325,7 +339,7 @@ static void SetZsPageMovable(struct zs_pool *pool, struct zspage *zspage) {}
 
 static int create_cache(struct zs_pool *pool)
 {
-	pool->handle_cachep = kmem_cache_create("zs_handle", ZS_HANDLE_SIZE,
+	pool->handle_cachep = kmem_cache_create("zs_handle", ZS_HANDLE_ALLOC_SIZE,
 					0, 0, NULL);
 	if (!pool->handle_cachep)
 		return 1;
@@ -349,9 +363,26 @@ static void destroy_cache(struct zs_pool *pool)
 
 static unsigned long cache_alloc_handle(struct zs_pool *pool, gfp_t gfp)
 {
-	return (unsigned long)kmem_cache_alloc(pool->handle_cachep,
-			gfp & ~(__GFP_HIGHMEM|__GFP_MOVABLE|__GFP_CMA));
+	void *p;
+
+	p = kmem_cache_alloc(pool->handle_cachep,
+			     gfp & ~(__GFP_HIGHMEM|__GFP_MOVABLE|__GFP_CMA));
+#ifdef CONFIG_PREEMPT_RT_FULL
+	if (p) {
+		struct zsmalloc_handle *zh = p;
+
+		mutex_init(&zh->lock);
+	}
+#endif
+	return (unsigned long)p;
 }
+
+#ifdef CONFIG_PREEMPT_RT_FULL
+static struct zsmalloc_handle *zs_get_pure_handle(unsigned long handle)
+{
+	return (void *)(handle &~((1 << OBJ_TAG_BITS) - 1));
+}
+#endif
 
 static void cache_free_handle(struct zs_pool *pool, unsigned long handle)
 {
@@ -371,12 +402,18 @@ static void cache_free_zspage(struct zs_pool *pool, struct zspage *zspage)
 
 static void record_obj(unsigned long handle, unsigned long obj)
 {
+#ifdef CONFIG_PREEMPT_RT_FULL
+	struct zsmalloc_handle *zh = zs_get_pure_handle(handle);
+
+	WRITE_ONCE(zh->addr, obj);
+#else
 	/*
 	 * lsb of @obj represents handle lock while other bits
 	 * represent object value the handle is pointing so
 	 * updating shouldn't do store tearing.
 	 */
 	WRITE_ONCE(*(unsigned long *)handle, obj);
+#endif
 }
 
 /* zpool driver */
@@ -404,7 +441,10 @@ static int zs_zpool_malloc(void *pool, size_t size, gfp_t gfp,
 			unsigned long *handle)
 {
 	*handle = zs_malloc(pool, size, gfp);
-	return *handle ? 0 : -1;
+
+	if (IS_ERR((void *)(*handle)))
+		return PTR_ERR((void *)*handle);
+	return 0;
 }
 static void zs_zpool_free(void *pool, unsigned long handle)
 {
@@ -458,6 +498,7 @@ MODULE_ALIAS("zpool-zsmalloc");
 
 /* per-cpu VM mapping areas for zspage accesses that cross page boundaries */
 static DEFINE_PER_CPU(struct mapping_area, zs_map_area);
+static DEFINE_LOCAL_IRQ_LOCK(zs_map_area_lock);
 
 static bool is_zspage_isolated(struct zspage *zspage)
 {
@@ -887,7 +928,13 @@ static unsigned long location_to_obj(struct page *page, unsigned int obj_idx)
 
 static unsigned long handle_to_obj(unsigned long handle)
 {
+#ifdef CONFIG_PREEMPT_RT_FULL
+	struct zsmalloc_handle *zh = zs_get_pure_handle(handle);
+
+	return zh->addr;
+#else
 	return *(unsigned long *)handle;
+#endif
 }
 
 static unsigned long obj_to_head(struct page *page, void *obj)
@@ -901,22 +948,46 @@ static unsigned long obj_to_head(struct page *page, void *obj)
 
 static inline int testpin_tag(unsigned long handle)
 {
+#ifdef CONFIG_PREEMPT_RT_FULL
+	struct zsmalloc_handle *zh = zs_get_pure_handle(handle);
+
+	return mutex_is_locked(&zh->lock);
+#else
 	return bit_spin_is_locked(HANDLE_PIN_BIT, (unsigned long *)handle);
+#endif
 }
 
 static inline int trypin_tag(unsigned long handle)
 {
+#ifdef CONFIG_PREEMPT_RT_FULL
+	struct zsmalloc_handle *zh = zs_get_pure_handle(handle);
+
+	return mutex_trylock(&zh->lock);
+#else
 	return bit_spin_trylock(HANDLE_PIN_BIT, (unsigned long *)handle);
+#endif
 }
 
 static void pin_tag(unsigned long handle)
 {
+#ifdef CONFIG_PREEMPT_RT_FULL
+	struct zsmalloc_handle *zh = zs_get_pure_handle(handle);
+
+	return mutex_lock(&zh->lock);
+#else
 	bit_spin_lock(HANDLE_PIN_BIT, (unsigned long *)handle);
+#endif
 }
 
 static void unpin_tag(unsigned long handle)
 {
+#ifdef CONFIG_PREEMPT_RT_FULL
+	struct zsmalloc_handle *zh = zs_get_pure_handle(handle);
+
+	return mutex_unlock(&zh->lock);
+#else
 	bit_spin_unlock(HANDLE_PIN_BIT, (unsigned long *)handle);
+#endif
 }
 
 static void reset_page(struct page *page)
@@ -1342,7 +1413,7 @@ void *zs_map_object(struct zs_pool *pool, unsigned long handle,
 	class = pool->size_class[class_idx];
 	off = (class->size * obj_idx) & ~PAGE_MASK;
 
-	area = &get_cpu_var(zs_map_area);
+	area = &get_locked_var(zs_map_area_lock, zs_map_area);
 	area->vm_mm = mm;
 	if (off + class->size <= PAGE_SIZE) {
 		/* this object is contained entirely within a page */
@@ -1396,7 +1467,7 @@ void zs_unmap_object(struct zs_pool *pool, unsigned long handle)
 
 		__zs_unmap_object(area, pages, off, class->size);
 	}
-	put_cpu_var(zs_map_area);
+	put_locked_var(zs_map_area_lock, zs_map_area);
 
 	migrate_read_unlock(zspage);
 	unpin_tag(handle);
@@ -1471,7 +1542,7 @@ static unsigned long obj_malloc(struct size_class *class,
  * @gfp: gfp flags when allocating object
  *
  * On success, handle to the allocated object is returned,
- * otherwise 0.
+ * otherwise an ERR_PTR().
  * Allocation requests with size > ZS_MAX_ALLOC_SIZE will fail.
  */
 unsigned long zs_malloc(struct zs_pool *pool, size_t size, gfp_t gfp)
@@ -1482,11 +1553,11 @@ unsigned long zs_malloc(struct zs_pool *pool, size_t size, gfp_t gfp)
 	struct zspage *zspage;
 
 	if (unlikely(!size || size > ZS_MAX_ALLOC_SIZE))
-		return 0;
+		return (unsigned long)ERR_PTR(-EINVAL);
 
 	handle = cache_alloc_handle(pool, gfp);
 	if (!handle)
-		return 0;
+		return (unsigned long)ERR_PTR(-ENOMEM);
 
 	/* extra space in chunk to keep the handle */
 	size += ZS_HANDLE_SIZE;
@@ -1509,7 +1580,7 @@ unsigned long zs_malloc(struct zs_pool *pool, size_t size, gfp_t gfp)
 	zspage = alloc_zspage(pool, class, gfp);
 	if (!zspage) {
 		cache_free_handle(pool, handle);
-		return 0;
+		return (unsigned long)ERR_PTR(-ENOMEM);
 	}
 
 	spin_lock(&class->lock);
@@ -2082,7 +2153,7 @@ static int zs_page_migrate(struct address_space *mapping, struct page *newpage,
 	 * Here, any user cannot access all objects in the zspage so let's move.
 	 */
 	d_addr = kmap_atomic(newpage);
-	memcpy(d_addr, s_addr, PAGE_SIZE);
+	copy_page(d_addr, s_addr);
 	kunmap_atomic(d_addr);
 
 	for (addr = s_addr + offset; addr < s_addr + pos;

@@ -69,6 +69,7 @@
 #include <net/sock.h>
 #include <net/ip.h>
 #include "slab.h"
+#include <linux/locallock.h>
 
 #include <linux/uaccess.h>
 
@@ -93,6 +94,8 @@ int do_swap_account __read_mostly;
 #else
 #define do_swap_account		0
 #endif
+
+static DEFINE_LOCAL_IRQ_LOCK(event_lock);
 
 /* Whether legacy memory+swap accounting is active */
 static bool do_memsw_account(void)
@@ -1184,12 +1187,14 @@ void mem_cgroup_update_lru_size(struct lruvec *lruvec, enum lru_list lru,
 		*lru_size += nr_pages;
 
 	size = *lru_size;
+#ifndef CONFIG_LRU_GEN
 	if (WARN_ONCE(size < 0,
 		"%s(%p, %d, %d): lru_size %ld\n",
 		__func__, lruvec, lru, nr_pages, size)) {
 		VM_BUG_ON(1);
 		*lru_size = 0;
 	}
+#endif
 
 	if (nr_pages > 0)
 		*lru_size += nr_pages;
@@ -2090,7 +2095,7 @@ static void drain_all_stock(struct mem_cgroup *root_memcg)
 	 * as well as workers from this path always operate on the local
 	 * per-cpu data. CPU up doesn't touch memcg_stock at all.
 	 */
-	curcpu = get_cpu();
+	curcpu = get_cpu_light();
 	for_each_online_cpu(cpu) {
 		struct memcg_stock_pcp *stock = &per_cpu(memcg_stock, cpu);
 		struct mem_cgroup *memcg;
@@ -2111,7 +2116,7 @@ static void drain_all_stock(struct mem_cgroup *root_memcg)
 				schedule_work_on(cpu, &stock->work);
 		}
 	}
-	put_cpu();
+	put_cpu_light();
 	mutex_unlock(&percpu_charge_mutex);
 }
 
@@ -2399,7 +2404,7 @@ static void lock_page_lru(struct page *page, int *isolated)
 
 		lruvec = mem_cgroup_page_lruvec(page, zone->zone_pgdat);
 		ClearPageLRU(page);
-		del_page_from_lru_list(page, lruvec, page_lru(page));
+		del_page_from_lru_list(page, lruvec);
 		*isolated = 1;
 	} else
 		*isolated = 0;
@@ -2415,7 +2420,7 @@ static void unlock_page_lru(struct page *page, int isolated)
 		lruvec = mem_cgroup_page_lruvec(page, zone->zone_pgdat);
 		VM_BUG_ON_PAGE(PageLRU(page), page);
 		SetPageLRU(page);
-		add_page_to_lru_list(page, lruvec, page_lru(page));
+		add_page_to_lru_list(page, lruvec);
 	}
 	spin_unlock_irq(zone_lru_lock(zone));
 }
@@ -2447,6 +2452,7 @@ static void commit_charge(struct page *page, struct mem_cgroup *memcg,
 	 *
 	 * - a page cache insertion, a swapin fault, or a migration
 	 *   have the page locked
+	 * - mem_cgroup_trylock_pages()
 	 */
 	page->mem_cgroup = memcg;
 
@@ -3523,8 +3529,8 @@ static int memcg_stat_show(struct seq_file *m, void *v)
 		pg_data_t *pgdat;
 		struct mem_cgroup_per_node *mz;
 		struct zone_reclaim_stat *rstat;
-		unsigned long recent_rotated[2] = {0, 0};
-		unsigned long recent_scanned[2] = {0, 0};
+		unsigned long recent_rotated[ANON_AND_FILE] = {};
+		unsigned long recent_scanned[ANON_AND_FILE] = {};
 
 		for_each_online_pgdat(pgdat) {
 			mz = mem_cgroup_nodeinfo(memcg, pgdat->node_id);
@@ -3558,7 +3564,7 @@ static int mem_cgroup_swappiness_write(struct cgroup_subsys_state *css,
 {
 	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
 
-	if (val > 100)
+	if (val > 200)
 		return -EINVAL;
 
 	if (css->parent)
@@ -4519,6 +4525,7 @@ static void __mem_cgroup_free(struct mem_cgroup *memcg)
 
 static void mem_cgroup_free(struct mem_cgroup *memcg)
 {
+	lru_gen_exit_memcg(memcg);
 	memcg_wb_domain_exit(memcg);
 	__mem_cgroup_free(memcg);
 }
@@ -4569,6 +4576,7 @@ static struct mem_cgroup *mem_cgroup_alloc(void)
 	INIT_LIST_HEAD(&memcg->cgwb_list);
 #endif
 	idr_replace(&mem_cgroup_idr, memcg, memcg->id.id);
+	lru_gen_init_memcg(memcg);
 	return memcg;
 fail:
 	mem_cgroup_id_remove(memcg);
@@ -4951,12 +4959,12 @@ static int mem_cgroup_move_account(struct page *page,
 
 	ret = 0;
 
-	local_irq_disable();
+	local_lock_irq(event_lock);
 	mem_cgroup_charge_statistics(to, page, compound, nr_pages);
 	memcg_check_events(to, page);
 	mem_cgroup_charge_statistics(from, page, compound, -nr_pages);
 	memcg_check_events(from, page);
-	local_irq_enable();
+	local_unlock_irq(event_lock);
 out_unlock:
 	unlock_page(page);
 out:
@@ -5443,6 +5451,30 @@ static void mem_cgroup_move_task(void)
 }
 #endif
 
+#ifdef CONFIG_LRU_GEN
+static void mem_cgroup_attach(struct cgroup_taskset *tset)
+{
+	struct task_struct *task;
+	struct cgroup_subsys_state *css;
+
+	/* find the first leader if there is any */
+	cgroup_taskset_for_each_leader(task, css, tset)
+		break;
+
+	if (!task)
+		return;
+
+	task_lock(task);
+	if (task->mm && READ_ONCE(task->mm->owner) == task)
+		lru_gen_migrate_mm(task->mm);
+	task_unlock(task);
+}
+#else
+static void mem_cgroup_attach(struct cgroup_taskset *tset)
+{
+}
+#endif /* CONFIG_LRU_GEN */
+
 /*
  * Cgroup retains root cgroups across [un]mount cycles making it necessary
  * to verify whether we're attached to the default hierarchy on each mount
@@ -5812,6 +5844,7 @@ struct cgroup_subsys memory_cgrp_subsys = {
 	.css_free = mem_cgroup_css_free,
 	.css_reset = mem_cgroup_css_reset,
 	.can_attach = mem_cgroup_can_attach,
+	.attach = mem_cgroup_attach,
 	.cancel_attach = mem_cgroup_cancel_attach,
 	.post_attach = mem_cgroup_move_task,
 	.bind = mem_cgroup_bind,
@@ -6075,10 +6108,10 @@ void mem_cgroup_commit_charge(struct page *page, struct mem_cgroup *memcg,
 
 	commit_charge(page, memcg, lrucare);
 
-	local_irq_disable();
+	local_lock_irq(event_lock);
 	mem_cgroup_charge_statistics(memcg, page, compound, nr_pages);
 	memcg_check_events(memcg, page);
-	local_irq_enable();
+	local_unlock_irq(event_lock);
 
 	if (do_memsw_account() && PageSwapCache(page)) {
 		swp_entry_t entry = { .val = page_private(page) };
@@ -6147,7 +6180,7 @@ static void uncharge_batch(const struct uncharge_gather *ug)
 		memcg_oom_recover(ug->memcg);
 	}
 
-	local_irq_save(flags);
+	local_lock_irqsave(event_lock, flags);
 	__mod_memcg_state(ug->memcg, MEMCG_RSS, -ug->nr_anon);
 	__mod_memcg_state(ug->memcg, MEMCG_CACHE, -ug->nr_file);
 	__mod_memcg_state(ug->memcg, MEMCG_RSS_HUGE, -ug->nr_huge);
@@ -6155,7 +6188,7 @@ static void uncharge_batch(const struct uncharge_gather *ug)
 	__count_memcg_events(ug->memcg, PGPGOUT, ug->pgpgout);
 	__this_cpu_add(ug->memcg->stat_cpu->nr_page_events, nr_pages);
 	memcg_check_events(ug->memcg, ug->dummy_page);
-	local_irq_restore(flags);
+	local_unlock_irqrestore(event_lock, flags);
 
 	if (!mem_cgroup_is_root(ug->memcg))
 		css_put_many(&ug->memcg->css, nr_pages);
@@ -6318,10 +6351,10 @@ void mem_cgroup_migrate(struct page *oldpage, struct page *newpage)
 
 	commit_charge(newpage, memcg, false);
 
-	local_irq_save(flags);
+	local_lock_irqsave(event_lock, flags);
 	mem_cgroup_charge_statistics(memcg, newpage, compound, nr_pages);
 	memcg_check_events(memcg, newpage);
-	local_irq_restore(flags);
+	local_unlock_irqrestore(event_lock, flags);
 }
 
 DEFINE_STATIC_KEY_FALSE(memcg_sockets_enabled_key);
@@ -6503,6 +6536,7 @@ void mem_cgroup_swapout(struct page *page, swp_entry_t entry)
 	struct mem_cgroup *memcg, *swap_memcg;
 	unsigned int nr_entries;
 	unsigned short oldid;
+	unsigned long flags;
 
 	VM_BUG_ON_PAGE(PageLRU(page), page);
 	VM_BUG_ON_PAGE(page_count(page), page);
@@ -6548,10 +6582,14 @@ void mem_cgroup_swapout(struct page *page, swp_entry_t entry)
 	 * important here to have the interrupts disabled because it is the
 	 * only synchronisation we have for updating the per-CPU variables.
 	 */
+	local_lock_irqsave(event_lock, flags);
+#ifndef CONFIG_PREEMPT_RT_BASE
 	VM_BUG_ON(!irqs_disabled());
+#endif
 	mem_cgroup_charge_statistics(memcg, page, PageTransHuge(page),
 				     -nr_entries);
 	memcg_check_events(memcg, page);
+	local_unlock_irqrestore(event_lock, flags);
 
 	if (!mem_cgroup_is_root(memcg))
 		css_put_many(&memcg->css, nr_entries);

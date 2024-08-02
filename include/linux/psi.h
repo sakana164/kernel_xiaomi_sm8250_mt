@@ -46,12 +46,6 @@ static inline void psi_init(void) {}
 static inline void psi_memstall_enter(unsigned long *flags) {}
 static inline void psi_memstall_leave(unsigned long *flags) {}
 
-static inline void psi_emergency_trigger(void){}
-static inline bool psi_is_trigger_active(void)
-{
-	return false;
-}
-
 #ifdef CONFIG_CGROUPS
 static inline int psi_cgroup_alloc(struct cgroup *cgrp)
 {

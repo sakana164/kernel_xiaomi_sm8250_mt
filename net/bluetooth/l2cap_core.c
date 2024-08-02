@@ -1373,7 +1373,8 @@ static void l2cap_request_info(struct l2cap_conn *conn)
 	conn->info_state |= L2CAP_INFO_FEAT_MASK_REQ_SENT;
 	conn->info_ident = l2cap_get_ident(conn);
 
-	schedule_delayed_work(&conn->info_timer, L2CAP_INFO_TIMEOUT);
+	queue_delayed_work(system_power_efficient_wq,
+			&conn->info_timer, L2CAP_INFO_TIMEOUT);
 
 	l2cap_send_cmd(conn, conn->info_ident, L2CAP_INFO_REQ,
 		       sizeof(req), &req);
@@ -3955,7 +3956,8 @@ sendresp:
 		conn->info_state |= L2CAP_INFO_FEAT_MASK_REQ_SENT;
 		conn->info_ident = l2cap_get_ident(conn);
 
-		schedule_delayed_work(&conn->info_timer, L2CAP_INFO_TIMEOUT);
+		queue_delayed_work(system_power_efficient_wq,
+				&conn->info_timer, L2CAP_INFO_TIMEOUT);
 
 		l2cap_send_cmd(conn, conn->info_ident, L2CAP_INFO_REQ,
 			       sizeof(info), &info);
@@ -5316,13 +5318,7 @@ static inline int l2cap_conn_param_update_req(struct l2cap_conn *conn,
 
 	memset(&rsp, 0, sizeof(rsp));
 
-	if (max > hcon->le_conn_max_interval) {
-		BT_DBG("requested connection interval exceeds current bounds.");
-		err = -EINVAL;
-	} else {
-		err = hci_check_conn_params(min, max, latency, to_multiplier);
-	}
-
+	err = hci_check_conn_params(min, max, latency, to_multiplier);
 	if (err)
 		rsp.result = cpu_to_le16(L2CAP_CONN_PARAM_REJECTED);
 	else
