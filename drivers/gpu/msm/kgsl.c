@@ -5340,7 +5340,7 @@ int kgsl_of_property_read_ddrtype(struct device_node *node, const char *base,
 int kgsl_device_platform_probe(struct kgsl_device *device)
 {
 	int status = -EINVAL;
-	struct sched_param param = { .sched_priority = 16 };
+	struct sched_param param = { .sched_priority = MAX_RT_PRIO / 2 };
 
 	status = _register_device(device);
 	if (status)
@@ -5441,7 +5441,7 @@ int kgsl_device_platform_probe(struct kgsl_device *device)
 	}
 
 	device->events_worker = kthread_create_worker(0, "kgsl-events");
-	sched_setscheduler(device->events_worker->task, SCHED_FIFO, &param);
+	sched_setscheduler_nocheck(device->events_worker->task, SCHED_FIFO, &param);
 
 	/* Initialize the snapshot engine */
 	kgsl_device_snapshot_init(device);
