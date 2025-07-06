@@ -237,18 +237,6 @@ static void unregister_memcg_shrinker(struct shrinker *shrinker)
 }
 #endif /* CONFIG_MEMCG_KMEM */
 
-static void set_task_reclaim_state(struct task_struct *task,
-				   struct reclaim_state *rs)
-{
-	/* Check for an overwrite */
-	WARN_ON_ONCE(rs && task->reclaim_state);
-
-	/* Check for the nulling of an already-nulled member */
-	WARN_ON_ONCE(!rs && !task->reclaim_state);
-
-	task->reclaim_state = rs;
-}
-
 #ifdef CONFIG_MEMCG
 static bool global_reclaim(struct scan_control *sc)
 {
@@ -3353,7 +3341,8 @@ unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 	if (throttle_direct_reclaim(sc.gfp_mask, zonelist, nodemask))
 		return 1;
 
-        set_task_reclaim_state(current, &sc.reclaim_state);
+        current->reclaim_state = &sc.reclaim_state;
+
 	trace_mm_vmscan_direct_reclaim_begin(order,
 				sc.may_writepage,
 				sc.gfp_mask,
@@ -3362,7 +3351,7 @@ unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 	nr_reclaimed = do_try_to_free_pages(zonelist, &sc);
 
 	trace_mm_vmscan_direct_reclaim_end(nr_reclaimed);
-	set_task_reclaim_state(current, NULL);
+	current->reclaim_state = NULL;
 
 	return nr_reclaimed;
 }
@@ -3384,7 +3373,7 @@ unsigned long mem_cgroup_shrink_node(struct mem_cgroup *memcg,
 	};
 	unsigned long lru_pages;
 
-	set_task_reclaim_state(current, &sc.reclaim_state);
+	current->reclaim_state = &sc.reclaim_state;
 	sc.gfp_mask = (gfp_mask & GFP_RECLAIM_MASK) |
 			(GFP_HIGHUSER_MOVABLE & ~GFP_RECLAIM_MASK);
 
@@ -3404,7 +3393,7 @@ unsigned long mem_cgroup_shrink_node(struct mem_cgroup *memcg,
 
 	trace_mm_vmscan_memcg_softlimit_reclaim_end(sc.nr_reclaimed);
 
-	set_task_reclaim_state(current, NULL);
+	current->reclaim_state = NULL;
 	*nr_scanned = sc.nr_scanned;
 
 	return sc.nr_reclaimed;
@@ -3432,7 +3421,7 @@ unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
 		.may_swap = may_swap,
 	};
 
-	set_task_reclaim_state(current, &sc.reclaim_state);
+	current->reclaim_state = &sc.reclaim_state;
 	/*
 	 * Unlike direct reclaim via alloc_pages(), memcg's reclaim doesn't
 	 * take care of from where we get pages. So the node where we start the
@@ -3456,7 +3445,7 @@ unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
 	psi_memstall_leave(&pflags);
 
 	trace_mm_vmscan_memcg_reclaim_end(nr_reclaimed);
-	set_task_reclaim_state(current, NULL);
+	current->reclaim_state = NULL;
 
 	return nr_reclaimed;
 }
@@ -3630,7 +3619,7 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int classzone_idx)
 		.may_swap = 1,
 	};
 
-	set_task_reclaim_state(current, &sc.reclaim_state);
+	current->reclaim_state = &sc.reclaim_state;
 	psi_memstall_enter(&pflags);
 	__fs_reclaim_acquire();
 
@@ -3734,7 +3723,7 @@ out:
 	snapshot_refaults(NULL, pgdat);
 	__fs_reclaim_release();
 	psi_memstall_leave(&pflags);
-	set_task_reclaim_state(current, NULL);
+	current->reclaim_state = NULL;
 
 	/*
 	 * Return the order kswapd stopped reclaiming at as
@@ -4004,16 +3993,17 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
 		.hibernation_mode = 1,
 	};
 	struct zonelist *zonelist = node_zonelist(numa_node_id(), sc.gfp_mask);
+	struct task_struct *p = current;
 	unsigned long nr_reclaimed;
 	unsigned int noreclaim_flag;
 
 	fs_reclaim_acquire(sc.gfp_mask);
 	noreclaim_flag = memalloc_noreclaim_save();
-	set_task_reclaim_state(current, &sc.reclaim_state);
+	p->reclaim_state = &sc.reclaim_state;
 
 	nr_reclaimed = do_try_to_free_pages(zonelist, &sc);
 
-	set_task_reclaim_state(current, NULL);
+	p->reclaim_state = NULL;
 	memalloc_noreclaim_restore(noreclaim_flag);
 	fs_reclaim_release(sc.gfp_mask);
 
@@ -4199,7 +4189,7 @@ static int __node_reclaim(struct pglist_data *pgdat, gfp_t gfp_mask, unsigned in
 	 */
 	noreclaim_flag = memalloc_noreclaim_save();
 	p->flags |= PF_SWAPWRITE;
-	set_task_reclaim_state(p, &sc.reclaim_state);
+	p->reclaim_state = &sc.reclaim_state;
 
 	if (node_pagecache_reclaimable(pgdat) > pgdat->min_unmapped_pages) {
 		/*
@@ -4211,7 +4201,7 @@ static int __node_reclaim(struct pglist_data *pgdat, gfp_t gfp_mask, unsigned in
 		} while (sc.nr_reclaimed < nr_pages && --sc.priority >= 0);
 	}
 
-	set_task_reclaim_state(p, NULL);
+	p->reclaim_state = NULL;
 	current->flags &= ~PF_SWAPWRITE;
 	memalloc_noreclaim_restore(noreclaim_flag);
 	fs_reclaim_release(sc.gfp_mask);
